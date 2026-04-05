@@ -8,7 +8,9 @@ Header:
   unless --disable-torque-on-exit is passed.
 
 Usage:
-  ./scripts/lerobot_motor_tui.py --port /dev/tty.usbmodemXXXX
+  PORT=/dev/tty.usbmodemXXXX ./scripts/lerobot_motor_tui.py
+
+If PORT is not set, the script auto-detects /dev/tty.usbmodem* devices.
 
 Controls:
   ↑/↓  select motor
@@ -18,6 +20,7 @@ Controls:
 
 import argparse
 import curses
+import os
 import sys
 import time
 from pathlib import Path
@@ -64,7 +67,6 @@ def clamp(v: int, lo: int, hi: int) -> int:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Simple motor jog TUI")
-    p.add_argument("--port", required=True, help="Serial port, e.g. /dev/tty.usbmodemXXXX")
     p.add_argument("--step", type=int, default=10, help="Ticks to move per left/right keypress")
     p.add_argument(
         "--disable-torque-on-exit",
@@ -72,6 +74,35 @@ def parse_args() -> argparse.Namespace:
         help="Disable torque when exiting (default: keep torque enabled)",
     )
     return p.parse_args()
+
+
+def resolve_port() -> str:
+    env_port = os.getenv("PORT", "").strip()
+    if env_port:
+        return env_port
+
+    # Equivalent to: ls /dev | grep '^tty\.usbmodem'
+    candidates = sorted(str(p) for p in Path("/dev").glob("tty.usbmodem*"))
+
+    if len(candidates) == 1:
+        port = candidates[0]
+        print(f"Auto-detected serial port: {port}", file=sys.stderr)
+        return port
+
+    script = Path(sys.argv[0]).name or "script.py"
+    if len(candidates) > 1:
+        msg = [
+            "Multiple usbmodem serial devices found:",
+            *(f"  - {p}" for p in candidates),
+            "",
+            f"Please choose one explicitly, e.g. PORT=/dev/tty.usbmodemXXXX ./{script}",
+        ]
+        raise SystemExit("\n".join(msg))
+
+    raise SystemExit(
+        "No /dev/tty.usbmodem* devices found. "
+        f"Set a port explicitly, e.g. PORT=/dev/tty.usbmodemXXXX ./{script}"
+    )
 
 
 def add_line(stdscr, y: int, x: int, text: str, attr: int = 0) -> None:
@@ -193,7 +224,8 @@ def main() -> None:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise SystemExit("This script requires an interactive TTY.")
 
-    bus = make_bus(args.port)
+    port = resolve_port()
+    bus = make_bus(port)
     bus._connect(handshake=False)  # noqa: SLF001
 
     try:
