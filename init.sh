@@ -16,4 +16,10 @@ elif [ ! -d "lerobot/.git" ]; then
   git clone https://github.com/huggingface/lerobot.git lerobot
 fi
 
-uv pip install -r requirements.txt
+if [ -d ".venv" ]; then
+  echo "Using existing virtual environment at .venv"
+else
+  uv venv
+fi
+
+uv pip install --python .venv/bin/python -r requirements.txt
