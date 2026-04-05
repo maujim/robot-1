@@ -16,4 +16,4 @@ elif [ ! -d "lerobot/.git" ]; then
   git clone https://github.com/huggingface/lerobot.git lerobot
 fi
 
-uv pip install -r reqs
+uv pip install -r requirements.txt
