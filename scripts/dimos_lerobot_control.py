@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,9 @@ try:
     from dimos.core.blueprints import autoconnect
     from dimos.core.core import rpc
     from dimos.core.module import Module
+    from dimos.core.stream import In, Out
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    from langchain_core.messages.base import BaseMessage
 except ImportError as exc:  # pragma: no cover - direct runtime guidance
     raise SystemExit(
         "DimOS is required for this script. Install it first, for example:\n"
@@ -57,6 +61,29 @@ MOTOR_NAMES = [
     "gripper",
     "wrist_roll",
 ]
+
+LEROBOT_SYSTEM_PROMPT = f"""
+You are a cautious motor-control assistant for a 6-axis LeRobot arm connected through DimOS MCP tools.
+
+# SAFETY
+- Prioritize human safety and hardware safety.
+- Do not move more than necessary.
+- Prefer reading state before moving if the user request is ambiguous.
+- If the user asks for a large or unclear motion, ask a short clarifying question first.
+- Use `stop_all_motion` if the user asks you to stop, freeze, or hold position.
+- Never claim a movement happened unless a motor tool returned success.
+
+# ROBOT CONTEXT
+- Available joints: {", ".join(MOTOR_NAMES)}.
+- The tools operate in raw servo ticks, not Cartesian space.
+- `jog_joint` is the safest default for small moves.
+- `set_joint_goal` should be used only when the user gives a clear absolute target.
+- The gripper is the `gripper` joint.
+
+# RESPONSE STYLE
+- Be concise and action-oriented.
+- Briefly explain what tool you are about to use when it helps the user trust the action.
+"""
 
 
 def make_bus(port: str) -> FeetechMotorsBus:
@@ -236,13 +263,122 @@ class LeRobotMotorSkills(Module):
         return self._json({"ok": True, "torque_enabled": False})
 
 
+class TerminalChatBridge(Module):
+    """Simple terminal chat bridge for direct natural-language control."""
+
+    human_input: Out[str]
+    agent: In[BaseMessage]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._stdin_loop,
+            name=f"{self.__class__.__name__}-stdin",
+            daemon=True,
+        )
+
+    @rpc
+    def start(self) -> None:
+        super().start()
+
+        def _on_agent_message(message: BaseMessage) -> None:
+            rendered = self._render_message(message)
+            if rendered:
+                print(rendered, flush=True)
+
+        self._disposables.add(self.agent.subscribe(_on_agent_message))
+
+        if not sys.stdin.isatty():
+            print(
+                "[chat] stdin is not a TTY; skipping interactive chat bridge. "
+                "Use `dimos agent-send` or another MCP client instead.",
+                flush=True,
+            )
+            return
+
+        self._thread.start()
+
+    @rpc
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        super().stop()
+
+    def _stdin_loop(self) -> None:
+        print(
+            "[chat] natural-language control is ready. Type commands, or `/quit` to exit.",
+            flush=True,
+        )
+        while not self._stop_event.is_set():
+            try:
+                line = input("you> ").strip()
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                print("", flush=True)
+                break
+
+            if not line:
+                continue
+            if line.lower() in {"/quit", "quit", "exit"}:
+                print("[chat] exiting interactive prompt. Press Ctrl-C if the process should stop.", flush=True)
+                break
+
+            self.human_input.publish(line)
+
+    def _render_message(self, message: BaseMessage) -> str | None:
+        if isinstance(message, HumanMessage):
+            return None
+
+        text = _message_content_to_text(message.content)
+        if not text:
+            return None
+
+        if isinstance(message, AIMessage):
+            return f"agent> {text}"
+        if isinstance(message, ToolMessage):
+            name = getattr(message, "name", None) or "tool"
+            return f"{name}> {text}"
+        return f"{message.__class__.__name__}> {text}"
+
+
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, Sequence):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                if item.strip():
+                    parts.append(item.strip())
+                continue
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = str(item.get("text", "")).strip()
+                if text:
+                    parts.append(text)
+        return "\n".join(parts).strip()
+
+    return str(content).strip()
+
+
+def _resolve_mcp_server_url(host: str, port: int) -> str:
+    client_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    return f"http://{client_host}:{port}/mcp"
+
+
 def build_blueprint(
     port: str,
+    agent_model: str = "gpt-4o",
+    mcp_server_url: str = "http://127.0.0.1:9990/mcp",
+    include_terminal_chat: bool = False,
     disable_torque_on_exit: bool = False,
     max_jog_ticks: int = 50,
     max_goal_step_ticks: int = 250,
 ):
-    return autoconnect(
+    modules = [
         LeRobotMotorSkills.blueprint(
             port=port,
             disable_torque_on_exit=disable_torque_on_exit,
@@ -250,12 +386,39 @@ def build_blueprint(
             max_goal_step_ticks=max_goal_step_ticks,
         ),
         McpServer.blueprint(),
-        mcp_client(),
-    )
+        mcp_client(
+            model=agent_model,
+            system_prompt=LEROBOT_SYSTEM_PROMPT,
+            mcp_server_url=mcp_server_url,
+        ),
+    ]
+
+    if include_terminal_chat:
+        modules.append(TerminalChatBridge.blueprint())
+
+    return autoconnect(*modules)
 
 
 lerobot_agentic_mcp = build_blueprint(
     port=os.environ.get("LEROBOT_PORT", "/dev/tty.usbmodemXXXX"),
+    agent_model=os.environ.get("LEROBOT_AGENT_MODEL", "gpt-4o"),
+    mcp_server_url=_resolve_mcp_server_url(
+        os.environ.get("DIMOS_MCP_HOST", "127.0.0.1"),
+        int(os.environ.get("DIMOS_MCP_PORT", "9990")),
+    ),
+    disable_torque_on_exit=os.environ.get("LEROBOT_DISABLE_TORQUE_ON_EXIT", "").lower() in {"1", "true", "yes"},
+    max_jog_ticks=int(os.environ.get("LEROBOT_MAX_JOG_TICKS", "50")),
+    max_goal_step_ticks=int(os.environ.get("LEROBOT_MAX_GOAL_STEP_TICKS", "250")),
+)
+
+lerobot_agentic_chat_mcp = build_blueprint(
+    port=os.environ.get("LEROBOT_PORT", "/dev/tty.usbmodemXXXX"),
+    agent_model=os.environ.get("LEROBOT_AGENT_MODEL", "gpt-4o"),
+    mcp_server_url=_resolve_mcp_server_url(
+        os.environ.get("DIMOS_MCP_HOST", "127.0.0.1"),
+        int(os.environ.get("DIMOS_MCP_PORT", "9990")),
+    ),
+    include_terminal_chat=True,
     disable_torque_on_exit=os.environ.get("LEROBOT_DISABLE_TORQUE_ON_EXIT", "").lower() in {"1", "true", "yes"},
     max_jog_ticks=int(os.environ.get("LEROBOT_MAX_JOG_TICKS", "50")),
     max_goal_step_ticks=int(os.environ.get("LEROBOT_MAX_GOAL_STEP_TICKS", "250")),
@@ -265,8 +428,18 @@ lerobot_agentic_mcp = build_blueprint(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DimOS chat and MCP control for LeRobot motors")
     parser.add_argument("--port", required=True, help="Serial port, e.g. /dev/tty.usbmodemXXXX")
+    parser.add_argument(
+        "--agent-model",
+        default=os.environ.get("LEROBOT_AGENT_MODEL", "gpt-4o"),
+        help="Hosted or local LLM model name for the DimOS agent, e.g. gpt-4o or ollama:llama3.1",
+    )
     parser.add_argument("--mcp-port", type=int, default=9990, help="MCP HTTP port for McpServer")
     parser.add_argument("--mcp-host", default="127.0.0.1", help="MCP bind host")
+    parser.add_argument(
+        "--no-chat",
+        action="store_true",
+        help="Disable the built-in terminal chat bridge and expose only MCP/DimOS endpoints",
+    )
     parser.add_argument(
         "--disable-torque-on-exit",
         action="store_true",
@@ -292,11 +465,28 @@ def main() -> None:
     os.environ["DIMOS_MCP_PORT"] = str(args.mcp_port)
     os.environ["DIMOS_MCP_HOST"] = args.mcp_host
 
+    if not args.agent_model.startswith("ollama:") and not os.environ.get("OPENAI_API_KEY"):
+        raise SystemExit(
+            "OPENAI_API_KEY is required for hosted natural-language control. "
+            "Set it in the environment or use a local model such as `--agent-model ollama:llama3.1`."
+        )
+
+    mcp_server_url = _resolve_mcp_server_url(args.mcp_host, args.mcp_port)
+
     blueprint = build_blueprint(
         port=args.port,
+        agent_model=args.agent_model,
+        mcp_server_url=mcp_server_url,
+        include_terminal_chat=not args.no_chat,
         disable_torque_on_exit=args.disable_torque_on_exit,
         max_jog_ticks=args.max_jog_ticks,
         max_goal_step_ticks=args.max_goal_step_ticks,
+    )
+    print(
+        f"[startup] MCP server: {mcp_server_url}\n"
+        f"[startup] agent model: {args.agent_model}\n"
+        "[startup] You can chat in this terminal or use `dimos mcp call ...` from another shell.",
+        flush=True,
     )
     blueprint.build().loop()
 
